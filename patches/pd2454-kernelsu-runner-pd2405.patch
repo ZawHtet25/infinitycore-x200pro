@@ -1,0 +1,13 @@
+diff --git a/src/ksupatch.c b/src/ksupatch.c
+index 36e62c1..8123853 100644
+--- a/src/ksupatch.c
++++ b/src/ksupatch.c
+@@ -82,7 +82,7 @@ static const struct target functions[] = {
+     {"avtab_insert_nonunique", UINT64_C(0xffffffc08064b640)},
+     {"change_pid", UINT64_C(0xffffffc0800dd028)},
+ };
+-static const char vermagic[] = "vermagic=6.6.127-android15-8-g3b723d0e8507-abogki558056638-4k SMP preempt mod_unload modversions aarch64";
++static const char vermagic[] = "vermagic=6.6.127-android15-8-g3b723d0e8507-abogki558077879-4k SMP preempt mod_unload modversions aarch64";
+ static const char *forbidden[] = {
+     "selinux_state", "selinux_blob_sizes", "mntns_operations", "init_mm", "__tracepoint_sys_enter",
+ };

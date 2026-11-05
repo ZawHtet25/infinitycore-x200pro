@@ -1,0 +1,61 @@
+diff --git a/app/src/main/kotlin/dev/kailashrs/infinitylock/engine/Payload.kt b/app/src/main/kotlin/dev/kailashrs/infinitylock/engine/Payload.kt
+index f5694a5..cdf82fd 100644
+--- a/app/src/main/kotlin/dev/kailashrs/infinitylock/engine/Payload.kt
++++ b/app/src/main/kotlin/dev/kailashrs/infinitylock/engine/Payload.kt
+@@ -11,8 +11,8 @@ enum class Payload(val asset: String, val remoteName: String) {
+ }
+ 
+ object Target {
+-    const val KERNEL = "6.6.127-android15-8-g3b723d0e8507-abogki558056638-4k"
+-    const val PRODUCT_VERSION = "PD2454_A_17.2.10.6.W10"
++    const val KERNEL = "6.6.127-android15-8-g3b723d0e8507-abogki558077879-4k"
++    const val PRODUCT_VERSION = "PD2405_A_17.2.11.3.W10"
+     const val REMOTE_DIR = "/data/local/tmp"
+     const val WORK_DIR = "/data/local/tmp/.infinitylock"
+     const val MODE_0755 = 493
+diff --git a/build-payload.sh b/build-payload.sh
+index 3830c0a..2069b77 100755
+--- a/build-payload.sh
++++ b/build-payload.sh
+@@ -1,7 +1,7 @@
+ #!/usr/bin/env bash
+ set -euo pipefail
+ SCRIPT_DIR=$(cd -- "$(dirname -- "$0")" && pwd)
+-RUNNER_REF=${RUNNER_REF:-d1da756ec007ff1e5c59b89da34322fba5e757a7}
++RUNNER_REF=${RUNNER_REF:-<YOUR_FORK_COMMIT_SHA>}
+ KERNELSU_REF=${KERNELSU_REF:-1dfdad51b824d701310f74b9eba5d69a63a9f50b}
+ DDK_IMAGE=${DDK_IMAGE:-ghcr.io/ylarod/ddk-min@sha256:51159bc935c75a282fc65bc87e02f16bd098d1cdf55dc558c4fdd0fcf7a132e2}
+ MANAGER_URL=https://github.com/tiann/KernelSU/releases/download/v3.3.1/KernelSU_v3.3.1_32680-release.apk
+@@ -16,7 +16,7 @@ STRIP="$TOOLCHAIN/llvm-strip"
+ WORK=$(mktemp -d)
+ trap 'python3 -c "import shutil,sys; shutil.rmtree(sys.argv[1], ignore_errors=True)" "$WORK"' EXIT
+ mkdir -p "$WORK/payload"
+-git clone --quiet https://github.com/kailashrs/pd2454-kernelsu-runner.git "$WORK/runner"
++git clone --quiet https://github.com/<YOUR_GH_USERNAME>/pd2454-kernelsu-runner.git "$WORK/runner"
+ git -C "$WORK/runner" checkout --quiet "$RUNNER_REF"
+ git clone --quiet https://github.com/kailashrs/KernelSU.git "$WORK/kernelsu"
+ git -C "$WORK/kernelsu" checkout --quiet "$KERNELSU_REF"
+@@ -35,7 +35,7 @@ echo "$KSUD_SHA256  $WORK/payload/ksud" | shasum -a 256 -c -
+ docker run --rm --platform linux/amd64 -v "$WORK:/build" "$DDK_IMAGE" /bin/bash -lc '
+ set -euo pipefail
+ KDIR=/opt/ddk/kdir/android15-6.6
+-TARGET=6.6.127-android15-8-g3b723d0e8507-abogki558056638-4k
++TARGET=6.6.127-android15-8-g3b723d0e8507-abogki558077879-4k
+ echo "$TARGET" > "$KDIR/include/config/kernel.release"
+ echo "#define UTS_RELEASE \"$TARGET\"" > "$KDIR/include/generated/utsrelease.h"
+ make -C "$KDIR" M=/build/kernelsu/kernel ARCH=arm64 LLVM=1 CONFIG_KSU=m CONFIG_KSU_NO_TEXT_POKE=y CONFIG_KSU_SELF_RESOLVED_DATA=y KSU_GIT_VERSION_VALID=1 KSU_GIT_VERSION=2680 GIT=/bin/false KBUILD_MODPOST_WARN=1 KSU_NEW_DCACHE_FLUSH=1 -j2 modules
+diff --git a/native/run.sh b/native/run.sh
+index 704a63d..0a3fa02 100644
+--- a/native/run.sh
++++ b/native/run.sh
+@@ -10,8 +10,8 @@ case "$LOG_PATH" in
+     /sdcard/InfinityLock/infinitylock-run-*.log) ;;
+     *) echo 'invalid runner log path' >&2; exit 2 ;;
+ esac
+-KERNEL=6.6.127-android15-8-g3b723d0e8507-abogki558056638-4k
+-PRODUCT_VERSION=PD2454_A_17.2.10.6.W10
++KERNEL=6.6.127-android15-8-g3b723d0e8507-abogki558077879-4k
++PRODUCT_VERSION=PD2405_A_17.2.11.3.W10
+ WORK=/data/local/tmp/.infinitylock
+ BOOT=$(cat /proc/sys/kernel/random/boot_id 2>/dev/null || true)
+ case "$BOOT" in ????????-????-????-????-????????????) ;; *) echo 'REFUSED invalid boot ID'; exit 2;; esac
