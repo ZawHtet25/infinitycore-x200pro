@@ -1,0 +1,78 @@
+name: Build APK
+
+on:
+  push:
+    branches: [eoleun]
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Gradle 8.9 (no wrapper in repo)
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.9'
+
+      - name: Guard - bundled ic98260 must match the hash pinned in the app
+        run: |
+          PIN=$(grep -oP 'EXPECTED_SHA\s*=\s*"\K[0-9a-f]{64}' \
+            app/app/src/main/java/com/pd2405/ic/MainActivity.kt)
+          GOT=$(sha256sum app/app/src/main/assets/ic98260 | cut -d' ' -f1)
+          echo "pinned in app : $PIN"
+          echo "bundled asset : $GOT"
+          if [ -z "$PIN" ]; then
+            echo "::error::Could not read EXPECTED_SHA from MainActivity.kt"; exit 1
+          fi
+          if [ "$PIN" != "$GOT" ]; then
+            echo "::error::app/app/src/main/assets/ic98260 does not match the sha256 pinned in MainActivity.kt - re-stage the tested v5 binary or update the pin"
+            exit 1
+          fi
+
+      - name: Build debug APK
+        run: gradle -p app assembleDebug --no-daemon --stacktrace
+
+      - name: Collect APK with a predictable name
+        run: |
+          mkdir -p out
+          APK=$(ls app/app/build/outputs/apk/debug/*.apk | head -n1)
+          cp "$APK" "out/ic98260-app-${GITHUB_SHA::7}-debug.apk"
+          sha256sum out/*.apk | tee out/SHA256SUMS.txt
+          echo "APK=out/ic98260-app-${GITHUB_SHA::7}-debug.apk" >> "$GITHUB_ENV"
+
+      - name: Upload artifact (every build)
+        uses: actions/upload-artifact@v4
+        with:
+          name: ic98260-app-${{ github.sha }}
+          path: |
+            out/*.apk
+            out/SHA256SUMS.txt
+          retention-days: 30
+          if-no-files-found: error
+
+      - name: Release (only on tag push, e.g. v1.0)
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            out/*.apk
+            out/SHA256SUMS.txt
+          generate_release_notes: true
