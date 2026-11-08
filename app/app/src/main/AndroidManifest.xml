@@ -15,7 +15,7 @@
 
         <!-- Shizuku provider: lets this app execute commands as shell (uid 2000).
              The exploit REQUIRES the shell SELinux context (tracefs read), so
-             Shizuku -- not app context -- is the correct executor. -->
+             Shizuku (not app context) is the correct executor. -->
         <provider
             android:name="rikka.shizuku.ShizukuProvider"
             android:authorities="${applicationId}.shizuku"
